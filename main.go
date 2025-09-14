@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/pflag"
 )
 
+var version = "dev" // set by build system
+
 // Parameters holds command-line parameters.
 type Parameters struct {
 	InputFile  string // path to input ICS file
@@ -28,9 +30,10 @@ func ParseFlags() Parameters {
 	)
 
 	pflag.StringVarP(&icsFile, "input", "i", "", "Input ICS file (required)")
-	pflag.StringVarP(&csvFile, "output", "o", "", "Output CSV file (default: input name with .csv extension, or 'stdout')")
+	pflag.StringVarP(&csvFile, "output", "o", "", "Output CSV file or 'stdout'(default: input name with .csv extension)")
 	pflag.BoolVarP(&multiline, "multiline", "m", false, "Preserve newlines and whitespace in fields")
 	pflag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "ics2csv (version %s): convert ICS to CSV\n", version)
 		fmt.Fprintf(os.Stderr, "Usage: ics2csv --input <input.ics> [--output <output.csv>|stdout]\n")
 		pflag.PrintDefaults()
 	}
