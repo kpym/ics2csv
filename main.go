@@ -7,10 +7,48 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/arran4/golang-ical"
+	"github.com/spf13/pflag"
 )
+
+// Parameters holds command-line parameters.
+type Parameters struct {
+	InputFile  string // path to input ICS file
+	OutputFile string // path to output CSV file, or "stdout"
+	Multiline  bool   // whether to preserve newlines in fields
+}
+
+// ParseFlags parses command-line flags and returns Parameters.
+func ParseFlags() Parameters {
+	var (
+		icsFile   string
+		csvFile   string
+		multiline bool
+	)
+
+	pflag.StringVarP(&icsFile, "input", "i", "", "Input ICS file (required)")
+	pflag.StringVarP(&csvFile, "output", "o", "", "Output CSV file (default: input name with .csv extension, or 'stdout')")
+	pflag.BoolVarP(&multiline, "multiline", "m", false, "Preserve newlines and whitespace in fields")
+	pflag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ics2csv --input <input.ics> [--output <output.csv>|stdout]\n")
+		pflag.PrintDefaults()
+	}
+	pflag.Parse()
+
+	if icsFile == "" {
+		pflag.Usage()
+		os.Exit(1)
+	}
+	if csvFile == "" {
+		csvFile = strings.TrimSuffix(icsFile, ".ics") + ".csv"
+	}
+	return Parameters{
+		InputFile:  icsFile,
+		OutputFile: csvFile,
+		Multiline:  multiline,
+	}
+}
 
 // Event represents a calendar event.
 // The fields correspond to CSV columns.
@@ -24,6 +62,7 @@ type Event struct {
 	Location    string
 }
 
+// ToSlice converts the Event to a slice of strings for CSV writing.
 func (e *Event) ToSlice() []string {
 	return []string{
 		e.Subject,
@@ -36,6 +75,7 @@ func (e *Event) ToSlice() []string {
 	}
 }
 
+// Header returns the CSV header row.
 func Header() []string {
 	return []string{
 		"Subject",
@@ -48,46 +88,35 @@ func Header() []string {
 	}
 }
 
-func rawTimeParse(raw string) (dateStr, timeStr string, err error) {
-	const icsLayout = "20060102T150405"
+// toSingleLine converts a string to a single line by replacing all
+// groups of whitespaces (including newlines) with a single space.
+// Used when --oneliner flag is set.
+func toSingleLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
 
-	if raw == "" {
-		return
-	}
-
-	if t, err := time.Parse(icsLayout, raw); err == nil {
-		dateStr = t.Format("2006-01-02")
-		timeStr = t.Format("15:04")
-	}
-	return
+// doNothing returns the string unchanged.
+// Used when --oneliner flag is not set.
+func doNothing(s string) string {
+	return s
 }
 
 func main() {
 	var (
-		err     error         // temp error variable
-		icsFile string        // input ICS file name
-		csvFile string        // output CSV file name
-		icsf    *os.File      // input ICS file handle
-		csvf    *os.File      // output CSV file handle
-		cal     *ics.Calendar // parsed calendar
-		csvw    *csv.Writer   // CSV writer
+		err  error         // temp error variable
+		icsf *os.File      // input ICS file handle
+		csvf *os.File      // output CSV file handle
+		cal  *ics.Calendar // parsed calendar
+		csvw *csv.Writer   // CSV writer
 	)
-
-	// get the file names from command line arguments
-	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Println("Usage: ics2csv <input.ics> [<output.csv>|stdout]")
-		os.Exit(1)
+	// Read command-line parameters
+	params := ParseFlags()
+	normalize := toSingleLine
+	if params.Multiline {
+		normalize = doNothing
 	}
-	icsFile = os.Args[1]
-	if len(os.Args) == 3 {
-		csvFile = os.Args[2]
-	} else {
-		// use input name with .csv extension
-		csvFile = strings.TrimSuffix(icsFile, ".ics") + ".csv"
-	}
-
 	// Open and parse the ICS file
-	icsf, err = os.Open(icsFile)
+	icsf, err = os.Open(params.InputFile)
 	if err != nil {
 		fmt.Printf("Error opening ICS file: %v\n", err)
 		os.Exit(1)
@@ -101,10 +130,10 @@ func main() {
 	}
 
 	// Open the CSV file for writing
-	if csvFile == "stdout" {
+	if params.OutputFile == "stdout" {
 		csvf = os.Stdout
 	} else {
-		csvf, err = os.Create(csvFile)
+		csvf, err = os.Create(params.OutputFile)
 		if err != nil {
 			fmt.Printf("Error creating CSV file: %v\n", err)
 			os.Exit(1)
@@ -119,29 +148,24 @@ func main() {
 	csvw.Write(Header())
 
 	// Write events
-	for _, comp := range cal.Components {
+	for _, vevent := range cal.Events() {
 		var event Event
-		var startRaw, endRaw string
-		for _, prop := range comp.UnknownPropertiesIANAProperties() {
-			switch prop.IANAToken {
-			case "SUMMARY":
-				event.Subject = prop.Value
-			case "DTSTART":
-				startRaw = prop.Value
-			case "DTEND":
-				endRaw = prop.Value
-			case "DESCRIPTION":
-				event.Description = prop.Value
-			case "LOCATION":
-				event.Location = prop.Value
-			}
+		if p := vevent.GetProperty(ics.ComponentPropertySummary); p != nil {
+			event.Subject = normalize(p.Value)
 		}
-		// Parse start and end times
-		if event.StartDate, event.StartTime, err = rawTimeParse(startRaw); err != nil {
-			fmt.Printf("Error parsing start time: %v\n", err)
+		if p := vevent.GetProperty(ics.ComponentPropertyDescription); p != nil {
+			event.Description = normalize(p.Value)
 		}
-		if event.EndDate, event.EndTime, err = rawTimeParse(endRaw); err != nil {
-			fmt.Printf("Error parsing end time: %v\n", err)
+		if p := vevent.GetProperty(ics.ComponentPropertyLocation); p != nil {
+			event.Location = normalize(p.Value)
+		}
+		if t, e := vevent.GetStartAt(); e == nil {
+			event.StartDate = t.Format("2006-01-02")
+			event.StartTime = t.Format("15:04:05")
+		}
+		if t, e := vevent.GetEndAt(); e == nil {
+			event.EndDate = t.Format("2006-01-02")
+			event.EndTime = t.Format("15:04:05")
 		}
 		// Write event if it has a subject
 		if event.Subject != "" {
@@ -149,5 +173,5 @@ func main() {
 		}
 	}
 
-	fmt.Println("Conversion complete in", csvFile)
+	fmt.Println("Conversion complete in", params.OutputFile)
 }
