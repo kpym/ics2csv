@@ -1,0 +1,43 @@
+# workflow name
+name: goreleaser
+
+
+
+
+# on events
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - 
+        name: Fetch tags
+        run: git fetch --force --tags
+      -
+        name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: stable
+      -
+        name: Set env
+        run : echo "GOLDMARK_VERSION=$(go list -m -f '{{ .Version }}' github.com/yuin/goldmark)" >> $GITHUB_ENV
+      -
+        name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          distribution: goreleaser
+          version: latest
+          # DEPRECATED: --rm-dist was deprecated in favor of --clean, check https://goreleaser.com/deprecations#-rm-dist for more details
+          # args: release --rm-dist
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
