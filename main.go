@@ -29,20 +29,20 @@ func ParseFlags() Parameters {
 		multiline bool
 	)
 
-	pflag.StringVarP(&icsFile, "input", "i", "", "Input ICS file (required)")
 	pflag.StringVarP(&csvFile, "output", "o", "", "Output CSV file or 'stdout'(default: input name with .csv extension)")
 	pflag.BoolVarP(&multiline, "multiline", "m", false, "Preserve newlines and whitespace in fields")
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "ics2csv (version %s): convert ICS to CSV\n", version)
-		fmt.Fprintf(os.Stderr, "Usage: ics2csv --input <input.ics> [--output <output.csv>|stdout]\n")
+		fmt.Fprintf(os.Stderr, "Usage: ics2csv <input.ics> [--output <output.csv>|stdout]\n")
 		pflag.PrintDefaults()
 	}
 	pflag.Parse()
 
-	if icsFile == "" {
+	if pflag.NArg() < 1 {
 		pflag.Usage()
 		os.Exit(1)
 	}
+	icsFile = pflag.Arg(0)
 	if csvFile == "" {
 		csvFile = strings.TrimSuffix(icsFile, ".ics") + ".csv"
 	}

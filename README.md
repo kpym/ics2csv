@@ -13,16 +13,15 @@ A simple Go utility to convert iCalendar (.ics) files to CSV format.
 
 ```bash
 $ ics2csv --help
-Usage: ics2csv --input <input.ics> [--output <output.csv>|stdout]
-  -i, --input string    Input ICS file (required)
+Usage: ics2csv <input.ics> [--output <output.csv>|stdout]
   -m, --multiline       Preserve newlines and whitespace in fields
   -o, --output string   Output CSV file (default: input name with .csv extension, or 'stdout')
-```  
+```
 
 ### Example
 
 ```bash
-$ ics2csv -i input.ics
+$ ics2csv input.ics
 ```
 The output will be saved to `input.csv` by default.
 You can also specify the output file name or use `stdout` to print to the console.
@@ -31,7 +30,7 @@ By default, all fields are converted to a single line (all whitespace and newlin
 If you want to preserve newlines and whitespace in fields, use the `--multiline` (or `-m`) flag:
 
 ```bash
-$ ics2csv -mi input.ics
+$ ics2csv --multiline input.ics
 ```
 
 ### CSV Output Format
