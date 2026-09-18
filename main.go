@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/arran4/golang-ical"
 	"github.com/spf13/pflag"
@@ -104,6 +105,57 @@ func doNothing(s string) string {
 	return s
 }
 
+func parseDateTimeRaw(raw string, tz string) (string, string) {
+	layouts := []string{"20060102T150405", "20060102T1504", "20060102"}
+	var parsed time.Time
+	var err error
+	if tz != "" {
+		if loc, lerr := time.LoadLocation(tz); lerr == nil {
+			for _, L := range layouts {
+				parsed, err = time.ParseInLocation(L, raw, loc)
+				if err == nil {
+					return parsed.Format("2006-01-02"), parsed.Format("15:04:05")
+				}
+			}
+		}
+	}
+	for _, L := range layouts {
+		parsed, err = time.Parse(L, raw)
+		if err == nil {
+			return parsed.Format("2006-01-02"), parsed.Format("15:04:05")
+		}
+	}
+	return "", ""
+}
+
+func getStartStrings(vevent *ics.VEvent) (string, string) {
+	if t, err := vevent.GetStartAt(); err == nil {
+		return t.Format("2006-01-02"), t.Format("15:04:05")
+	}
+	if p := vevent.GetProperty("DTSTART"); p != nil {
+		tz := ""
+		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
+			tz = strings.Trim(v[0], "\"")
+		}
+		return parseDateTimeRaw(p.Value, tz)
+	}
+	return "", ""
+}
+
+func getEndStrings(vevent *ics.VEvent) (string, string) {
+	if t, err := vevent.GetEndAt(); err == nil {
+		return t.Format("2006-01-02"), t.Format("15:04:05")
+	}
+	if p := vevent.GetProperty("DTEND"); p != nil {
+		tz := ""
+		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
+			tz = strings.Trim(v[0], "\"")
+		}
+		return parseDateTimeRaw(p.Value, tz)
+	}
+	return "", ""
+}
+
 func main() {
 	var (
 		err  error         // temp error variable
@@ -162,14 +214,8 @@ func main() {
 		if p := vevent.GetProperty(ics.ComponentPropertyLocation); p != nil {
 			event.Location = normalize(p.Value)
 		}
-		if t, e := vevent.GetStartAt(); e == nil {
-			event.StartDate = t.Format("2006-01-02")
-			event.StartTime = t.Format("15:04:05")
-		}
-		if t, e := vevent.GetEndAt(); e == nil {
-			event.EndDate = t.Format("2006-01-02")
-			event.EndTime = t.Format("15:04:05")
-		}
+		event.StartDate, event.StartTime = getStartStrings(vevent)
+		event.EndDate, event.EndTime = getEndStrings(vevent)
 		// Write event if it has a subject
 		if event.Subject != "" {
 			csvw.Write(event.ToSlice())
