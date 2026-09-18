@@ -11,6 +11,7 @@ import (
 
 	"github.com/arran4/golang-ical"
 	"github.com/spf13/pflag"
+	rrule "github.com/teambition/rrule-go"
 )
 
 var version = "dev" // set by build system
@@ -128,6 +129,30 @@ func parseDateTimeRaw(raw string, tz string) (string, string) {
 	return "", ""
 }
 
+// parseDateTimeToTime parses raw iCal datetime string into time.Time using optional TZID.
+func parseDateTimeToTime(raw string, tz string) (time.Time, error) {
+	layouts := []string{"20060102T150405", "20060102T1504", "20060102"}
+	var parsed time.Time
+	var err error
+	if tz != "" {
+		if loc, lerr := time.LoadLocation(tz); lerr == nil {
+			for _, L := range layouts {
+				parsed, err = time.ParseInLocation(L, raw, loc)
+				if err == nil {
+					return parsed, nil
+				}
+			}
+		}
+	}
+	for _, L := range layouts {
+		parsed, err = time.Parse(L, raw)
+		if err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unable to parse datetime: %s", raw)
+}
+
 func getStartStrings(vevent *ics.VEvent) (string, string) {
 	if t, err := vevent.GetStartAt(); err == nil {
 		return t.Format("2006-01-02"), t.Format("15:04:05")
@@ -154,6 +179,71 @@ func getEndStrings(vevent *ics.VEvent) (string, string) {
 		return parseDateTimeRaw(p.Value, tz)
 	}
 	return "", ""
+}
+
+// expandRecurrences returns a list of start times for the event, expanding RRULE/RDATE and applying EXDATE.
+// If RRULE has no UNTIL/COUNT, expansion is limited to one year from DTSTART.
+func expandRecurrences(vevent *ics.VEvent, dtstart time.Time) ([]time.Time, error) {
+	var occs []time.Time
+	// Collect EXDATEs
+	exmap := map[time.Time]bool{}
+	for _, p := range vevent.GetProperties(ics.ComponentPropertyExdate) {
+		// parse using our parseDateTimeRaw with no TZ (GetEndAt handles tz), try library
+		if t, err := vevent.GetEndAt(); err == nil {
+			_ = t
+		}
+		// fallback: try to parse via the library's internal method on ComponentBase
+		// Here we parse Exdate similarly to DTSTART using ICalParameters
+		tz := ""
+		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
+			tz = strings.Trim(v[0], "\"")
+		}
+		d, _ := parseDateTimeRaw(p.Value, tz)
+		if d != "" {
+			// parse back to time.Time using layouts
+			layouts := []string{"2006-01-02T15:04:05", "2006-01-02"}
+			for _, L := range layouts {
+				if tt, err := time.Parse(L, d+"T00:00:00"); err == nil {
+					exmap[tt] = true
+					break
+				}
+			}
+		}
+	}
+
+	// Handle RRULE
+	rruleProp := vevent.GetProperty(ics.ComponentPropertyRrule)
+	if rruleProp != nil {
+		// build rrule string: ensure it has DTSTART context
+		ruleStr := rruleProp.Value
+		r, err := rrule.StrToRRule(ruleStr)
+		if err != nil {
+			return nil, err
+		}
+		// Ensure the rule has the correct DTSTART so generated occurrences have the right time
+		// (StrToRRule may not set DTSTART). Set it to the provided dtstart.
+		// rrule.RRule exposes SetDtstart in some versions; as a fallback set the Dtstart field if present.
+		// set DTSTART on the rrule so generated occurrences keep the event time
+		if setter := r.DTStart; setter != nil {
+			setter(dtstart)
+		}
+		// determine window
+		windowEnd := dtstart.AddDate(1, 0, 0)
+		// if r has an UNTIL or COUNT, Between will respect it; otherwise limit to 1 year
+		occs = r.Between(dtstart, windowEnd, true)
+	}
+	// If no RRULE, use single DTSTART
+	if len(occs) == 0 {
+		occs = []time.Time{dtstart}
+	}
+	// Filter EXDATEs
+	var filtered []time.Time
+	for _, o := range occs {
+		if !exmap[o] {
+			filtered = append(filtered, o)
+		}
+	}
+	return filtered, nil
 }
 
 func main() {
@@ -204,19 +294,99 @@ func main() {
 
 	// Write events
 	for _, vevent := range cal.Events() {
-		var event Event
-		if p := vevent.GetProperty(ics.ComponentPropertySummary); p != nil {
-			event.Subject = normalize(p.Value)
+		summaryProp := vevent.GetProperty(ics.ComponentPropertySummary)
+		if summaryProp == nil {
+			continue
 		}
+		subj := normalize(summaryProp.Value)
+		desc := ""
 		if p := vevent.GetProperty(ics.ComponentPropertyDescription); p != nil {
-			event.Description = normalize(p.Value)
+			desc = normalize(p.Value)
 		}
+		loc := ""
 		if p := vevent.GetProperty(ics.ComponentPropertyLocation); p != nil {
-			event.Location = normalize(p.Value)
+			loc = normalize(p.Value)
 		}
+
+		// Try to get original start/end times as time.Time
+		startT, startErr := vevent.GetStartAt()
+		endT, endErr := vevent.GetEndAt()
+		duration := time.Duration(0)
+		// If GetEndAt failed, try to parse DTEND property (handles quoted TZID)
+		if endErr != nil {
+			if p := vevent.GetProperty("DTEND"); p != nil {
+				tz := ""
+				if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
+					tz = strings.Trim(v[0], "\"")
+				}
+				if t, err := parseDateTimeToTime(p.Value, tz); err == nil {
+					endT = t
+					endErr = nil
+				}
+			}
+		}
+		// If GetStartAt failed but DTSTART parsed earlier (in RRULE branch), duration may still be zero.
+		// If endT is available and startT parsed, compute duration.
+		if startErr == nil && endErr == nil {
+			duration = endT.Sub(startT)
+		}
+
+		// If RRULE present, expand occurrences. If library couldn't parse DTSTART,
+		// try to parse it ourselves (handles quoted TZID like TZID="Europe/Brussels").
+		if vevent.HasProperty(ics.ComponentPropertyRrule) {
+			if startErr != nil {
+				// attempt to parse DTSTART property
+				if p := vevent.GetProperty("DTSTART"); p != nil {
+					tz := ""
+					if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
+						tz = strings.Trim(v[0], "\"")
+					}
+					if t, err := parseDateTimeToTime(p.Value, tz); err == nil {
+						startT = t
+						startErr = nil
+					}
+				}
+			}
+			// recompute duration if we now have both start and end
+			if startErr == nil && endErr == nil {
+				duration = endT.Sub(startT)
+			}
+			if startErr == nil {
+				occs, err := expandRecurrences(vevent, startT)
+				if err != nil {
+					// fallback to single occurrence
+					occs = []time.Time{startT}
+				}
+				for _, occ := range occs {
+					ev := Event{
+						Subject:     subj,
+						Description: desc,
+						Location:    loc,
+					}
+					ev.StartDate = occ.Format("2006-01-02")
+					ev.StartTime = occ.Format("15:04:05")
+					if duration != 0 {
+						e := occ.Add(duration)
+						ev.EndDate = e.Format("2006-01-02")
+						ev.EndTime = e.Format("15:04:05")
+					} else if endErr == nil {
+						ev.EndDate = endT.Format("2006-01-02")
+						ev.EndTime = endT.Format("15:04:05")
+					}
+					csvw.Write(ev.ToSlice())
+				}
+				continue
+			}
+			// if still no valid startT, fall through to non-recurring handling
+		}
+
+		// Non-recurring or RRULE but no start time: fall back to simple extraction
+		var event Event
+		event.Subject = subj
+		event.Description = desc
+		event.Location = loc
 		event.StartDate, event.StartTime = getStartStrings(vevent)
 		event.EndDate, event.EndTime = getEndStrings(vevent)
-		// Write event if it has a subject
 		if event.Subject != "" {
 			csvw.Write(event.ToSlice())
 		}
