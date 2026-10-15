@@ -106,6 +106,9 @@ func doNothing(s string) string {
 	return s
 }
 
+// parseDateTimeRaw parses raw iCal datetime string into date and time strings using optional TZID.
+// Returns date string in "YYYY-MM-DD" and time string in "HH:MM:SS" format.
+// It is used when we want to extract date and time strings without converting to time.Time.
 func parseDateTimeRaw(raw string, tz string) (string, string) {
 	layouts := []string{"20060102T150405", "20060102T1504", "20060102"}
 	var parsed time.Time
@@ -131,7 +134,7 @@ func parseDateTimeRaw(raw string, tz string) (string, string) {
 
 // parseDateTimeToTime parses raw iCal datetime string into time.Time using optional TZID.
 func parseDateTimeToTime(raw string, tz string) (time.Time, error) {
-	layouts := []string{"20060102T150405", "20060102T1504", "20060102"}
+	layouts := []string{"20060102T150405Z07:00", "20060102T1504Z07:00", "20060102T150405", "20060102T1504", "20060102"}
 	var parsed time.Time
 	var err error
 	if tz != "" {
@@ -153,6 +156,7 @@ func parseDateTimeToTime(raw string, tz string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse datetime: %s", raw)
 }
 
+// getStartStrings returns the start date and time strings for a VEvent.
 func getStartStrings(vevent *ics.VEvent) (string, string) {
 	if t, err := vevent.GetStartAt(); err == nil {
 		return t.Format("2006-01-02"), t.Format("15:04:05")
@@ -167,6 +171,7 @@ func getStartStrings(vevent *ics.VEvent) (string, string) {
 	return "", ""
 }
 
+// getEndStrings returns the end date and time strings for a VEvent.
 func getEndStrings(vevent *ics.VEvent) (string, string) {
 	if t, err := vevent.GetEndAt(); err == nil {
 		return t.Format("2006-01-02"), t.Format("15:04:05")
@@ -186,27 +191,15 @@ func getEndStrings(vevent *ics.VEvent) (string, string) {
 func expandRecurrences(vevent *ics.VEvent, dtstart time.Time) ([]time.Time, error) {
 	var occs []time.Time
 	// Collect EXDATEs
-	exmap := map[time.Time]bool{}
+	exmap := map[int64]bool{}
 	for _, p := range vevent.GetProperties(ics.ComponentPropertyExdate) {
-		// parse using our parseDateTimeRaw with no TZ (GetEndAt handles tz), try library
-		if t, err := vevent.GetEndAt(); err == nil {
-			_ = t
-		}
-		// fallback: try to parse via the library's internal method on ComponentBase
-		// Here we parse Exdate similarly to DTSTART using ICalParameters
 		tz := ""
 		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
 			tz = strings.Trim(v[0], "\"")
 		}
-		d, _ := parseDateTimeRaw(p.Value, tz)
-		if d != "" {
-			// parse back to time.Time using layouts
-			layouts := []string{"2006-01-02T15:04:05", "2006-01-02"}
-			for _, L := range layouts {
-				if tt, err := time.Parse(L, d+"T00:00:00"); err == nil {
-					exmap[tt] = true
-					break
-				}
+		for _, raw := range strings.Split(p.Value, ",") {
+			if excluded, err := parseDateTimeToTime(raw, tz); err == nil {
+				exmap[excluded.UnixNano()] = true
 			}
 		}
 	}
@@ -239,7 +232,7 @@ func expandRecurrences(vevent *ics.VEvent, dtstart time.Time) ([]time.Time, erro
 	// Filter EXDATEs
 	var filtered []time.Time
 	for _, o := range occs {
-		if !exmap[o] {
+		if !exmap[o.UnixNano()] {
 			filtered = append(filtered, o)
 		}
 	}
