@@ -106,30 +106,14 @@ func doNothing(s string) string {
 	return s
 }
 
-// parseDateTimeRaw parses raw iCal datetime string into date and time strings using optional TZID.
-// Returns date string in "YYYY-MM-DD" and time string in "HH:MM:SS" format.
-// It is used when we want to extract date and time strings without converting to time.Time.
-func parseDateTimeRaw(raw string, tz string) (string, string) {
-	layouts := []string{"20060102T150405", "20060102T1504", "20060102"}
-	var parsed time.Time
-	var err error
-	if tz != "" {
-		if loc, lerr := time.LoadLocation(tz); lerr == nil {
-			for _, L := range layouts {
-				parsed, err = time.ParseInLocation(L, raw, loc)
-				if err == nil {
-					return parsed.Format("2006-01-02"), parsed.Format("15:04:05")
-				}
-			}
-		}
+// parseDateTimeToString parses a raw iCal datetime string using an optional TZID
+// and returns the date and time in "YYYY-MM-DD" and "HH:MM:SS" formats.
+func parseDateTimeToString(raw string, tz string) (string, string) {
+	parsed, err := parseDateTimeToTime(raw, tz)
+	if err != nil {
+		return "", ""
 	}
-	for _, L := range layouts {
-		parsed, err = time.Parse(L, raw)
-		if err == nil {
-			return parsed.Format("2006-01-02"), parsed.Format("15:04:05")
-		}
-	}
-	return "", ""
+	return parsed.Format("2006-01-02"), parsed.Format("15:04:05")
 }
 
 // parseDateTimeToTime parses raw iCal datetime string into time.Time using optional TZID.
@@ -166,7 +150,7 @@ func getStartStrings(vevent *ics.VEvent) (string, string) {
 		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
 			tz = strings.Trim(v[0], "\"")
 		}
-		return parseDateTimeRaw(p.Value, tz)
+		return parseDateTimeToString(p.Value, tz)
 	}
 	return "", ""
 }
@@ -181,7 +165,7 @@ func getEndStrings(vevent *ics.VEvent) (string, string) {
 		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
 			tz = strings.Trim(v[0], "\"")
 		}
-		return parseDateTimeRaw(p.Value, tz)
+		return parseDateTimeToString(p.Value, tz)
 	}
 	return "", ""
 }
