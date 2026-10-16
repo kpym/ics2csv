@@ -31,6 +31,7 @@ func ParseFlags() Parameters {
 		multiline bool
 	)
 
+	// Register supported flags and command-specific usage text.
 	pflag.StringVarP(&csvFile, "output", "o", "", "Output CSV file or 'stdout'(default: input name with .csv extension)")
 	pflag.BoolVarP(&multiline, "multiline", "m", false, "Preserve newlines and whitespace in fields")
 	pflag.Usage = func() {
@@ -38,8 +39,9 @@ func ParseFlags() Parameters {
 		fmt.Fprintf(os.Stderr, "Usage: ics2csv <input.ics> [--output <output.csv>|stdout]\n")
 		pflag.PrintDefaults()
 	}
-	pflag.Parse()
 
+	// Parse arguments, require an input, and derive the default output path.
+	pflag.Parse()
 	if pflag.NArg() < 1 {
 		pflag.Usage()
 		os.Exit(1)
@@ -93,27 +95,12 @@ func Header() []string {
 	}
 }
 
-// toSingleLine converts a string to a single line by replacing all
-// groups of whitespaces (including newlines) with a single space.
-// Used when --oneliner flag is set.
-func toSingleLine(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
-// doNothing returns the string unchanged.
-// Used when --oneliner flag is not set.
-func doNothing(s string) string {
-	return s
-}
-
-// parseDateTimeToString parses a raw iCal datetime string using an optional TZID
-// and returns the date and time in "YYYY-MM-DD" and "HH:MM:SS" formats.
-func parseDateTimeToString(raw string, tz string) (string, string) {
-	parsed, err := parseDateTimeToTime(raw, tz)
-	if err != nil {
-		return "", ""
+// normalizeText preserves line breaks when requested and otherwise collapses whitespace.
+func normalizeText(value string, preserveMultiline bool) string {
+	if preserveMultiline {
+		return value
 	}
-	return parsed.Format("2006-01-02"), parsed.Format("15:04:05")
+	return strings.Join(strings.Fields(value), " ")
 }
 
 // parseDateTimeToTime parses raw iCal datetime string into time.Time using optional TZID.
@@ -121,6 +108,7 @@ func parseDateTimeToTime(raw string, tz string) (time.Time, error) {
 	layouts := []string{"20060102T150405Z07:00", "20060102T1504Z07:00", "20060102T150405", "20060102T1504", "20060102"}
 	var parsed time.Time
 	var err error
+	// Try parsing in the supplied timezone before treating the value as floating or UTC.
 	if tz != "" {
 		if loc, lerr := time.LoadLocation(tz); lerr == nil {
 			for _, L := range layouts {
@@ -131,6 +119,7 @@ func parseDateTimeToTime(raw string, tz string) (time.Time, error) {
 			}
 		}
 	}
+	// Try the same supported layouts without a named timezone.
 	for _, L := range layouts {
 		parsed, err = time.Parse(L, raw)
 		if err == nil {
@@ -140,47 +129,48 @@ func parseDateTimeToTime(raw string, tz string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse datetime: %s", raw)
 }
 
-// getStartStrings returns the start date and time strings for a VEvent.
-func getStartStrings(vevent *ics.VEvent) (string, string) {
-	if t, err := vevent.GetStartAt(); err == nil {
-		return t.Format("2006-01-02"), t.Format("15:04:05")
+// getTZID returns the first TZID parameter value with surrounding quotes removed.
+func getTZID(parameters map[string][]string) string {
+	values := parameters["TZID"]
+	if len(values) == 0 {
+		return ""
 	}
-	if p := vevent.GetProperty("DTSTART"); p != nil {
-		tz := ""
-		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
-			tz = strings.Trim(v[0], "\"")
-		}
-		return parseDateTimeToString(p.Value, tz)
-	}
-	return "", ""
+	return strings.Trim(values[0], "\"")
 }
 
-// getEndStrings returns the end date and time strings for a VEvent.
-func getEndStrings(vevent *ics.VEvent) (string, string) {
-	if t, err := vevent.GetEndAt(); err == nil {
-		return t.Format("2006-01-02"), t.Format("15:04:05")
+// getDateTime resolves a date-time through the library, then falls back to its raw property.
+func getDateTime(vevent *ics.VEvent, propertyName string, getter func() (time.Time, error)) (time.Time, error) {
+	// Prefer the calendar library's parsed value.
+	value, err := getter()
+	if err == nil {
+		return value, nil
 	}
-	if p := vevent.GetProperty("DTEND"); p != nil {
-		tz := ""
-		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
-			tz = strings.Trim(v[0], "\"")
+
+	// Retry with the raw property when the library cannot parse it.
+	if p := vevent.GetProperty(ics.ComponentProperty(propertyName)); p != nil {
+		if value, parseErr := parseDateTimeToTime(p.Value, getTZID(p.ICalParameters)); parseErr == nil {
+			return value, nil
 		}
-		return parseDateTimeToString(p.Value, tz)
 	}
-	return "", ""
+	return time.Time{}, err
+}
+
+// formatDateTime returns date and time strings, or blanks when parsing failed.
+func formatDateTime(value time.Time, err error) (string, string) {
+	if err != nil {
+		return "", ""
+	}
+	return value.Format("2006-01-02"), value.Format("15:04:05")
 }
 
 // expandRecurrences returns a list of start times for the event, expanding RRULE/RDATE and applying EXDATE.
 // If RRULE has no UNTIL/COUNT, expansion is limited to one year from DTSTART.
 func expandRecurrences(vevent *ics.VEvent, dtstart time.Time) ([]time.Time, error) {
 	var occs []time.Time
-	// Collect EXDATEs
+	// Collect exclusions before generating recurrence instances.
 	exmap := map[int64]bool{}
 	for _, p := range vevent.GetProperties(ics.ComponentPropertyExdate) {
-		tz := ""
-		if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
-			tz = strings.Trim(v[0], "\"")
-		}
+		tz := getTZID(p.ICalParameters)
 		for _, raw := range strings.Split(p.Value, ",") {
 			if excluded, err := parseDateTimeToTime(raw, tz); err == nil {
 				exmap[excluded.UnixNano()] = true
@@ -188,32 +178,26 @@ func expandRecurrences(vevent *ics.VEvent, dtstart time.Time) ([]time.Time, erro
 		}
 	}
 
-	// Handle RRULE
+	// Expand RRULE within a one-year window; explicit COUNT or UNTIL still applies.
 	rruleProp := vevent.GetProperty(ics.ComponentPropertyRrule)
 	if rruleProp != nil {
-		// build rrule string: ensure it has DTSTART context
 		ruleStr := rruleProp.Value
 		r, err := rrule.StrToRRule(ruleStr)
 		if err != nil {
 			return nil, err
 		}
-		// Ensure the rule has the correct DTSTART so generated occurrences have the right time
-		// (StrToRRule may not set DTSTART). Set it to the provided dtstart.
-		// rrule.RRule exposes SetDtstart in some versions; as a fallback set the Dtstart field if present.
-		// set DTSTART on the rrule so generated occurrences keep the event time
+		// Anchor generated instances to the event's DTSTART.
 		if setter := r.DTStart; setter != nil {
 			setter(dtstart)
 		}
-		// determine window
 		windowEnd := dtstart.AddDate(1, 0, 0)
-		// if r has an UNTIL or COUNT, Between will respect it; otherwise limit to 1 year
 		occs = r.Between(dtstart, windowEnd, true)
 	}
-	// If no RRULE, use single DTSTART
+	// Retain DTSTART if expansion produced no instances.
 	if len(occs) == 0 {
 		occs = []time.Time{dtstart}
 	}
-	// Filter EXDATEs
+	// Remove instances listed by EXDATE.
 	var filtered []time.Time
 	for _, o := range occs {
 		if !exmap[o.UnixNano()] {
@@ -223,151 +207,120 @@ func expandRecurrences(vevent *ics.VEvent, dtstart time.Time) ([]time.Time, erro
 	return filtered, nil
 }
 
-func main() {
-	var (
-		err  error         // temp error variable
-		icsf *os.File      // input ICS file handle
-		csvf *os.File      // output CSV file handle
-		cal  *ics.Calendar // parsed calendar
-		csvw *csv.Writer   // CSV writer
-	)
-	// Read command-line parameters
-	params := ParseFlags()
-	normalize := toSingleLine
-	if params.Multiline {
-		normalize = doNothing
+// propertyText retrieves and normalizes an optional text property.
+func propertyText(vevent *ics.VEvent, property ics.ComponentProperty, preserveMultiline bool) string {
+	p := vevent.GetProperty(property)
+	if p == nil {
+		return ""
 	}
-	// Open and parse the ICS file
-	icsf, err = os.Open(params.InputFile)
-	if err != nil {
-		fmt.Printf("Error opening ICS file: %v\n", err)
-		os.Exit(1)
-	}
-	defer icsf.Close()
+	return normalizeText(p.Value, preserveMultiline)
+}
 
-	cal, err = ics.ParseCalendar(icsf)
-	if err != nil {
-		fmt.Printf("Error parsing ICS file: %v\n", err)
-		os.Exit(1)
+// eventsFromVEvent converts one calendar event into zero or more CSV rows.
+func eventsFromVEvent(vevent *ics.VEvent, preserveMultiline bool) []Event {
+	// A summary is required because it becomes the CSV subject.
+	summary := vevent.GetProperty(ics.ComponentPropertySummary)
+	if summary == nil {
+		return nil
 	}
 
-	// Open the CSV file for writing
-	if params.OutputFile == "stdout" {
-		csvf = os.Stdout
-	} else {
-		csvf, err = os.Create(params.OutputFile)
-		if err != nil {
-			fmt.Printf("Error creating CSV file: %v\n", err)
-			os.Exit(1)
-		}
-		defer csvf.Close()
+	event := Event{
+		Subject:     normalizeText(summary.Value, preserveMultiline),
+		Description: propertyText(vevent, ics.ComponentPropertyDescription, preserveMultiline),
+		Location:    propertyText(vevent, ics.ComponentPropertyLocation, preserveMultiline),
 	}
+	start, startErr := getDateTime(vevent, "DTSTART", vevent.GetStartAt)
+	end, endErr := getDateTime(vevent, "DTEND", vevent.GetEndAt)
 
-	csvw = csv.NewWriter(csvf)
-	defer csvw.Flush()
-
-	// Write header
-	csvw.Write(Header())
-
-	// Write events
-	for _, vevent := range cal.Events() {
-		summaryProp := vevent.GetProperty(ics.ComponentPropertySummary)
-		if summaryProp == nil {
-			continue
-		}
-		subj := normalize(summaryProp.Value)
-		desc := ""
-		if p := vevent.GetProperty(ics.ComponentPropertyDescription); p != nil {
-			desc = normalize(p.Value)
-		}
-		loc := ""
-		if p := vevent.GetProperty(ics.ComponentPropertyLocation); p != nil {
-			loc = normalize(p.Value)
-		}
-
-		// Try to get original start/end times as time.Time
-		startT, startErr := vevent.GetStartAt()
-		endT, endErr := vevent.GetEndAt()
+	// Recurring events produce one CSV row for each generated instance.
+	if vevent.HasProperty(ics.ComponentPropertyRrule) && startErr == nil {
 		duration := time.Duration(0)
-		// If GetEndAt failed, try to parse DTEND property (handles quoted TZID)
-		if endErr != nil {
-			if p := vevent.GetProperty("DTEND"); p != nil {
-				tz := ""
-				if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
-					tz = strings.Trim(v[0], "\"")
-				}
-				if t, err := parseDateTimeToTime(p.Value, tz); err == nil {
-					endT = t
-					endErr = nil
-				}
-			}
-		}
-		// If GetStartAt failed but DTSTART parsed earlier (in RRULE branch), duration may still be zero.
-		// If endT is available and startT parsed, compute duration.
-		if startErr == nil && endErr == nil {
-			duration = endT.Sub(startT)
+		if endErr == nil {
+			duration = end.Sub(start)
 		}
 
-		// If RRULE present, expand occurrences. If library couldn't parse DTSTART,
-		// try to parse it ourselves (handles quoted TZID like TZID="Europe/Brussels").
-		if vevent.HasProperty(ics.ComponentPropertyRrule) {
-			if startErr != nil {
-				// attempt to parse DTSTART property
-				if p := vevent.GetProperty("DTSTART"); p != nil {
-					tz := ""
-					if v, ok := p.ICalParameters["TZID"]; ok && len(v) > 0 {
-						tz = strings.Trim(v[0], "\"")
-					}
-					if t, err := parseDateTimeToTime(p.Value, tz); err == nil {
-						startT = t
-						startErr = nil
-					}
-				}
-			}
-			// recompute duration if we now have both start and end
-			if startErr == nil && endErr == nil {
-				duration = endT.Sub(startT)
-			}
-			if startErr == nil {
-				occs, err := expandRecurrences(vevent, startT)
-				if err != nil {
-					// fallback to single occurrence
-					occs = []time.Time{startT}
-				}
-				for _, occ := range occs {
-					ev := Event{
-						Subject:     subj,
-						Description: desc,
-						Location:    loc,
-					}
-					ev.StartDate = occ.Format("2006-01-02")
-					ev.StartTime = occ.Format("15:04:05")
-					if duration != 0 {
-						e := occ.Add(duration)
-						ev.EndDate = e.Format("2006-01-02")
-						ev.EndTime = e.Format("15:04:05")
-					} else if endErr == nil {
-						ev.EndDate = endT.Format("2006-01-02")
-						ev.EndTime = endT.Format("15:04:05")
-					}
-					csvw.Write(ev.ToSlice())
-				}
-				continue
-			}
-			// if still no valid startT, fall through to non-recurring handling
+		occurrences, err := expandRecurrences(vevent, start)
+		if err != nil {
+			occurrences = []time.Time{start}
 		}
 
-		// Non-recurring or RRULE but no start time: fall back to simple extraction
-		var event Event
-		event.Subject = subj
-		event.Description = desc
-		event.Location = loc
-		event.StartDate, event.StartTime = getStartStrings(vevent)
-		event.EndDate, event.EndTime = getEndStrings(vevent)
-		if event.Subject != "" {
-			csvw.Write(event.ToSlice())
+		events := make([]Event, 0, len(occurrences))
+		for _, occurrence := range occurrences {
+			recurringEvent := event
+			recurringEvent.StartDate, recurringEvent.StartTime = formatDateTime(occurrence, nil)
+			if endErr == nil {
+				occurrenceEnd := end
+				if duration != 0 {
+					occurrenceEnd = occurrence.Add(duration)
+				}
+				recurringEvent.EndDate, recurringEvent.EndTime = formatDateTime(occurrenceEnd, nil)
+			}
+			events = append(events, recurringEvent)
+		}
+		return events
+	}
+
+	// Non-recurring events produce at most one row; invalid dates remain blank.
+	event.StartDate, event.StartTime = formatDateTime(start, startErr)
+	event.EndDate, event.EndTime = formatDateTime(end, endErr)
+	if event.Subject == "" {
+		return nil
+	}
+	return []Event{event}
+}
+
+// run parses the input calendar and writes its converted events to CSV.
+func run() error {
+	// Parse the input calendar before opening the output destination.
+	params := ParseFlags()
+	icsFile, err := os.Open(params.InputFile)
+	if err != nil {
+		return fmt.Errorf("open ICS file: %w", err)
+	}
+	defer icsFile.Close()
+
+	calendar, err := ics.ParseCalendar(icsFile)
+	if err != nil {
+		return fmt.Errorf("parse ICS file: %w", err)
+	}
+
+	// Select stdout or create the requested CSV file.
+	var csvFile *os.File
+	if params.OutputFile == "stdout" {
+		csvFile = os.Stdout
+	} else {
+		csvFile, err = os.Create(params.OutputFile)
+		if err != nil {
+			return fmt.Errorf("create CSV file: %w", err)
+		}
+		defer csvFile.Close()
+	}
+
+	// Write the header and converted rows, then check deferred CSV errors.
+	csvWriter := csv.NewWriter(csvFile)
+	if err := csvWriter.Write(Header()); err != nil {
+		return fmt.Errorf("write CSV header: %w", err)
+	}
+	for _, vevent := range calendar.Events() {
+		for _, event := range eventsFromVEvent(vevent, params.Multiline) {
+			if err := csvWriter.Write(event.ToSlice()); err != nil {
+				return fmt.Errorf("write CSV event: %w", err)
+			}
 		}
 	}
 
-	fmt.Println("Conversion complete in", params.OutputFile)
+	csvWriter.Flush()
+	if err := csvWriter.Error(); err != nil {
+		return fmt.Errorf("flush CSV output: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Conversion complete in %s\n", params.OutputFile)
+	return nil
+}
+
+// main reports conversion errors and exits with a failure status.
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
